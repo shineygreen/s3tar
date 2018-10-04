@@ -246,7 +246,7 @@ def get_compressed_mode(name):
 	'''
 	filename, file_extension = os.path.splitext(name)
 	print(f'Name is {filename}, extension is {file_extension}')
-	if file_extension == 'gz':
+	if file_extension == '.gz':
 		mode = 'r|gz'
 	else:
 		mode = 'r|'

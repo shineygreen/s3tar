@@ -182,8 +182,12 @@ def extract_bucket(bucket_name, new_bucket_name, archive_name, s3, s3_client):
 		else:
 			target_bucket = bucket_name
 		archive_bucket = s3.Bucket(archive_name)
+		not_found = True  # Need to make sure we find something
 		for object in archive_bucket.objects.filter(Prefix=bucket_name):
+			not_found = false
 			print(object.key)
+		if not_found:
+			print(f'Did not find any tar files with the name {bucket_name} in archive {archive_name}')
 	except:
 		(err_type, value, tb) = sys.exc_info()
 		print (f'Unexpected error in archive_bucket, type {err_type}, value {value}')

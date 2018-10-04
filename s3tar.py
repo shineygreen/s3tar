@@ -61,7 +61,7 @@ def main():
 			archive = create_bucket(s3, s3_client, ARGS.region, ARGS.bucket_name)
 			archive_bucket(ARGS.bucket_name, ARGS.archive_name, s3, ARCHIVE_SIZE, ARGS.profile, ARGS.compression)
 		elif ARGS.extract:
-			extract_bucket(ARGS.bucket_name, ARGS.new_bucket_name, ARGS.archive_name, s3, s3_client)
+			extract_bucket(ARGS.bucket_name, ARGS.new_bucket_name, ARGS.archive_name, s3, s3_client, profile)
 		else:
 			print('Nothing to do, quitting')
 	except SystemExit as e:
@@ -166,7 +166,7 @@ def archive_bucket(bucket_name, archive_name, s3, size, profile, compress):
 		print (f'Unexpected error in archive_bucket, type {err_type}, value {value}')
 		traceback.print_tb(tb, limit=20)
 
-def extract_bucket(bucket_name, new_bucket_name, archive_name, s3, s3_client):
+def extract_bucket(bucket_name, new_bucket_name, archive_name, s3, , profile):
 	''' Given the name of bucket to create and an archive bucket,
 			read all of the tar files in the archive bucket and extract
 			them to the bucket. 

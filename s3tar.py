@@ -193,7 +193,7 @@ def extract_bucket(bucket_name, new_bucket_name, archive_name, s3, s3_client, pr
 			tf = tarfile.open(mode=mode, fileobj=archive_in)
 			for member in tf.getmembers():
 				with tf.extractfile(member) as data:
-					dest_bucket.upload_fileobj(data, tarinfo.name)
+					dest_bucket.upload_fileobj(data, member.name)
 			tf.close()
 			archive_in.close()
 		if not_found:

@@ -61,7 +61,7 @@ def main():
 			archive = create_bucket(s3, s3_client, ARGS.region, ARGS.bucket_name)
 			archive_bucket(ARGS.bucket_name, ARGS.archive_name, s3, ARCHIVE_SIZE, ARGS.profile, ARGS.compression)
 		elif ARGS.extract:
-			extract_bucket(ARGS.bucket_name, ARGS.new_bucket_name, ARGS.archive_name, s3, s3_client, profile)
+			extract_bucket(ARGS.bucket_name, ARGS.new_bucket_name, ARGS.archive_name, s3, s3_client, ARGS.profile)
 		else:
 			print('Nothing to do, quitting')
 	except SystemExit as e:

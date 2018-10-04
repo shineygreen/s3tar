@@ -186,6 +186,10 @@ def extract_bucket(bucket_name, new_bucket_name, archive_name, s3, s3_client):
 		for object in archive_bucket.objects.filter(Prefix=bucket_name):
 			not_found = false
 			print(object.key)
+			#archive_in = smart_open.smart_open(tar_name, 'rb', profile_name=profile)
+			# Need to test for zip file and set mode.
+			mode = get_compressed_mode(object.key)
+		  #tf = tarfile.open(mode=mode, fileobj=archive_in)
 		if not_found:
 			print(f'Did not find any tar files with the name {bucket_name} in archive {archive_name}')
 	except:
@@ -235,6 +239,19 @@ def create_tarinfo(object):
 		print (f'Unexpected error in get_tarinfo, type {err_type}, value {value}')
 		sys.exit(-1)
 
+def get_compressed_mode(name):
+	''' Given a filename, see if it has a .gz on the end.
+			If it does, return the tar mode for reading compressed tar files.
+			If it does not, return the tar mode for reading regular tar files.
+	'''
+	filename, file_extension = os.path.splitext(name)
+	print(f'Name is {filename}, extension is {file_extension}')
+	if file_extension == 'gz':
+		mode = 'r|gz'
+	else:
+		mode = 'r|'
+	print(f'Mode: {mode}')
+	return mode
 
 if __name__ == "__main__":
 	main()

@@ -166,6 +166,7 @@ def archive_bucket(bucket_name, archive_name, s3, size, profile, compress):
 		print (f'Unexpected error in archive_bucket, type {err_type}, value {value}')
 		traceback.print_tb(tb, limit=20)
 
+
 def extract_bucket(bucket_name, new_bucket_name, archive_name, s3, s3_client, profile):
 	''' Given the name of bucket to create and an archive bucket,
 			read all of the tar files in the archive bucket and extract
@@ -185,7 +186,7 @@ def extract_bucket(bucket_name, new_bucket_name, archive_name, s3, s3_client, pr
 		for object in archive_bucket.objects.filter(Prefix=bucket_name):
 			not_found = False
 			print(object.key)
-			tar_name = 's3://%s/%s_file%d%s' % (archive_name, object.key)
+			tar_name = 's3://%s/%s' % (archive_name, object.key)
 			archive_in = smart_open.smart_open(tar_name, 'rb', profile_name=profile)
 			# Need to test for zip file and set mode.
 			mode = get_compressed_mode(object.key)

@@ -188,12 +188,12 @@ def extract_bucket(bucket_name, new_bucket_name, archive_name, s3, s3_client):
 			archive_in = smart_open.smart_open(tar_name, 'rb', profile_name=profile)
 			# Need to test for zip file and set mode.
 			mode = get_compressed_mode(object.key)
-		  tf = tarfile.open(mode=mode, fileobj=archive_in)
-		  for member in tf.getmembers():
-		  	with tf.extractfile(member) as data:
-		  		dest_bucket.upload_fileobje(data, tarinfo.name)
-		  tf.close()
-		  archive_in.close()
+			tf = tarfile.open(mode=mode, fileobj=archive_in)
+			for member in tf.getmembers():
+				with tf.extractfile(member) as data:
+					dest_bucket.upload_fileobj(data, tarinfo.name)
+			tf.close()
+			archive_in.close()
 		if not_found:
 			print(f'Did not find any tar files with the name {bucket_name} in archive {archive_name}')
 	except:

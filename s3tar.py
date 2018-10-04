@@ -185,7 +185,7 @@ def extract_bucket(bucket_name, new_bucket_name, archive_name, s3, s3_client):
 		for object in archive_bucket.objects.filter(Prefix=bucket_name):
 			not_found = False
 			print(object.key)
-			archive_in = smart_open.smart_open(tar_name, 'rb', profile_name=profile)
+			archive_in = smart_open.smart_open(object.key, 'rb', profile_name=profile)
 			# Need to test for zip file and set mode.
 			mode = get_compressed_mode(object.key)
 			tf = tarfile.open(mode=mode, fileobj=archive_in)

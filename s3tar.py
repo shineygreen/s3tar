@@ -177,19 +177,23 @@ def extract_bucket(bucket_name, new_bucket_name, archive_name, s3, s3_client):
 			sys.exit(0)
 		archive = s3.Bucket(bucket_name)
 		if new_bucket_name != None:
-			new_bucket = create_bucket(s3, s3_client, ARGS.region, new_bucket_name)
-			target_bucket = new_bucket
+			dest_bucket = create_bucket(s3, s3_client, ARGS.region, new_bucket_name)
 		else:
-			target_bucket = bucket_name
+			dest_bucket = s3.Bucket(bucket_name)
 		archive_bucket = s3.Bucket(archive_name)
 		not_found = True  # Need to make sure we find something
 		for object in archive_bucket.objects.filter(Prefix=bucket_name):
 			not_found = False
 			print(object.key)
-			#archive_in = smart_open.smart_open(tar_name, 'rb', profile_name=profile)
+			archive_in = smart_open.smart_open(tar_name, 'rb', profile_name=profile)
 			# Need to test for zip file and set mode.
 			mode = get_compressed_mode(object.key)
-		  #tf = tarfile.open(mode=mode, fileobj=archive_in)
+		  tf = tarfile.open(mode=mode, fileobj=archive_in)
+		  for member in tf.getmembers():
+		  	with tf.extractfile(member) as data:
+		  		dest_bucket.upload_fileobje(data, tarinfo.name)
+		  tf.close()
+		  archive_in.close()
 		if not_found:
 			print(f'Did not find any tar files with the name {bucket_name} in archive {archive_name}')
 	except:

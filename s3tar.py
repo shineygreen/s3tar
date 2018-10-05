@@ -22,7 +22,7 @@ ARCHIVE_SIZE = 1000000000000
 
 PARSER = argparse.ArgumentParser('Tar up buckets')
 PARSER.add_argument('--bucket_name', '-b', required=True, help='The name of the bucket to archive')
-PARSER.add_argument('--new_bucket_name', '-n', help='The name of the bucket to extract files to.')
+PARSER.add_argument('--new_bucket_name', '-n', default=None, help='The name of the bucket to extract files to.')
 PARSER.add_argument('--profile', '-p', default=None, help='The AWS profile to use.')
 PARSER.add_argument('--archive_name', '-a', default='dai-archive', help='The name of the bucket to store the tarfiles in.')
 PARSER.add_argument('--region', '-r', default='us-west-2')
@@ -176,7 +176,6 @@ def extract_bucket(bucket_name, new_bucket_name, archive_name, s3, s3_client, pr
 		if not bucket_exists(archive_name, s3):
 			print(f'The archive bucket, {archive_bucket} does not exist, bailing out.')
 			sys.exit(0)
-		archive = s3.Bucket(bucket_name)
 		if new_bucket_name != None:
 			dest_bucket = create_bucket(s3, s3_client, ARGS.region, new_bucket_name)
 		else:

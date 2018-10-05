@@ -176,6 +176,7 @@ def extract_bucket(bucket_name, new_bucket_name, archive_name, s3, s3_client, pr
 		if not bucket_exists(archive_name, s3):
 			print(f'The archive bucket, {archive_bucket} does not exist, bailing out.')
 			sys.exit(0)
+		archive_bucket = s3.Bucket(archive_name)
 		if new_bucket_name != None:
 			print(f'Creating {new_bucket_name}')
 			dest_bucket = create_bucket(s3, s3_client, ARGS.region, new_bucket_name)

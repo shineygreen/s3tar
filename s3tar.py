@@ -97,6 +97,7 @@ def create_bucket(s3, s3_client, region, bucket_name):
 					Bucket=bucket_name, 
 					CreateBucketConfiguration={'LocationConstraint': region}
 					)
+			print(f'Response is: {response}')
 		return s3.Bucket(bucket_name)
 	except:
 		(err_type, value) = (sys.exc_info()[:2])
@@ -178,7 +179,6 @@ def extract_bucket(bucket_name, new_bucket_name, archive_name, s3, s3_client, pr
 			sys.exit(0)
 		archive_bucket = s3.Bucket(archive_name)
 		if new_bucket_name != None:
-			print(f'Creating {new_bucket_name}')
 			dest_bucket = create_bucket(s3, s3_client, ARGS.region, new_bucket_name)
 		else:
 			dest_bucket = s3.Bucket(bucket_name)

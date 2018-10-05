@@ -191,7 +191,8 @@ def extract_bucket(bucket_name, new_bucket_name, archive_name, s3, s3_client, pr
 			# Need to test for zip file and set mode.
 			mode = get_compressed_mode(object.key)
 			tf = tarfile.open(mode=mode, fileobj=archive_in)
-			while member = tf.next():
+			member = tf.next()
+			while member != None:
 				with tf.extractfile(member) as data:
 					bdata = io.BytesIO()
 					for line in data:
@@ -199,6 +200,7 @@ def extract_bucket(bucket_name, new_bucket_name, archive_name, s3, s3_client, pr
 					bdata.seek(0)
 					dest_bucket.upload_fileobj(bdata, member.name)
 					bdata.close
+				member = tf.next()
 			tf.close()
 			archive_in.close()
 		if not_found:

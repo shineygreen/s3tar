@@ -85,8 +85,13 @@ def check_args():
 	elif not ARGS.create and not ARGS.extract:
 		print('Either the -c or the -x flag must be specified')
 		sys.exit(0)
+	elif ARGS.extract:
+		if ARGS.new_bucket_name == None:
+			print ('A new bucket name must be specified for an extract operation.')
 	return
 
+META = 'ResponseMetadata'
+STATUS = 'HTTPStatusCode'
 def create_bucket(s3, s3_client, region, bucket_name):
 	''' See if the archive bucket exists, if not, create it.  
 	'''
@@ -97,7 +102,16 @@ def create_bucket(s3, s3_client, region, bucket_name):
 					Bucket=bucket_name, 
 					CreateBucketConfiguration={'LocationConstraint': region}
 					)
-			print(f'Response is: {response}')
+			if response[META][STATUS] != 200:
+				print(f'Bucket not created, bailing. HTTP Status is: {response[META][STATUS]}')
+				sys.exit(0)
+		else:
+			# Have not been able to figure out a simple way to check permissions, so
+			# see if we can read from and write to the bucket if it exists.
+			print('Bucket exists, checking policy')
+			policy = s3.BucketPolicy(bucket_name)
+			print(policy)
+			sys.exit(0)
 		return s3.Bucket(bucket_name)
 	except:
 		(err_type, value) = (sys.exc_info()[:2])
@@ -174,19 +188,20 @@ def extract_bucket(bucket_name, new_bucket_name, archive_name, s3, s3_client, pr
 			them to the bucket. 
 	'''
 	try:
+		# The archive bucket must exist, the new bucket must not exist.
+		# Whew! Existential issues.
 		if not bucket_exists(archive_name, s3):
 			print(f'The archive bucket, {archive_bucket} does not exist, bailing out.')
 			sys.exit(0)
-		archive_bucket = s3.Bucket(archive_name)
-		if new_bucket_name != None:
-			dest_bucket = create_bucket(s3, s3_client, ARGS.region, new_bucket_name)
+		if bucket_exists(new_bucket_name, s3):
+			print(f'The new bucket, {new_bucket_name}, already exists. Please provide name of non-existant bucket.')
+			sys.exit(0)
 		else:
-			dest_bucket = s3.Bucket(bucket_name)
-		print(f'Using {dest_bucket.name} as destination bucket.')
+			new_bucket = create_bucket(s3, s3_client, ARGS.region, new_bucket_name)
+		archive_bucket = s3.Bucket(archive_name)
 		not_found = True  # Need to make sure we find something
 		for object in archive_bucket.objects.filter(Prefix=bucket_name):
 			not_found = False
-			print(object.key)
 			tar_name = 's3://%s/%s' % (archive_name, object.key)
 			archive_in = smart_open.smart_open(tar_name, 'rb', profile_name=profile)
 			# Need to test for zip file and set mode.
@@ -199,13 +214,20 @@ def extract_bucket(bucket_name, new_bucket_name, archive_name, s3, s3_client, pr
 					for line in data:
 						bdata.write(line)
 					bdata.seek(0)
-					dest_bucket.upload_fileobj(bdata, member.name)
+					new_bucket.upload_fileobj(bdata, member.name)
 					bdata.close
 				member = tf.next()
 			tf.close()
 			archive_in.close()
 		if not_found:
 			print(f'Did not find any tar files with the name {bucket_name} in archive {archive_name}')
+	except SystemExit as e:
+		if e.code == 0:
+			os._exit(0)
+		else:
+			(err_type, value, tb) = (sys.exc_info())
+			print (f'Unexpected error in main, type {err_type}, value {value}')
+			traceback.print_tb(tb, limit=10)
 	except:
 		(err_type, value, tb) = sys.exc_info()
 		print (f'Unexpected error in archive_bucket, type {err_type}, value {value}')
@@ -259,12 +281,10 @@ def get_compressed_mode(name):
 			If it does not, return the tar mode for reading regular tar files.
 	'''
 	filename, file_extension = os.path.splitext(name)
-	print(f'Name is {filename}, extension is {file_extension}')
 	if file_extension == '.gz':
 		mode = 'r|gz'
 	else:
 		mode = 'r|'
-	print(f'Mode: {mode}')
 	return mode
 
 if __name__ == "__main__":

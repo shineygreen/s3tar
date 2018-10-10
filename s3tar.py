@@ -16,6 +16,7 @@ import tarfile
 import traceback
 import io
 import os
+import zlib
  
 # How much data to put in an archive file. Default is 1TB
 ARCHIVE_SIZE = 1000000000000
@@ -29,7 +30,9 @@ PARSER.add_argument('--region', '-r', default='us-west-2')
 PARSER.add_argument('--compression', '-z', action='store_true', help='Turn on gzip compression.')
 PARSER.add_argument('--create', '-c', action='store_true', help='Create a tar archive')
 PARSER.add_argument('--extract', '-x', action='store_true', help='Extract a tar archive')
+PARSER.add_argument('--verify', '-v', action='store_true', help = 'Verify that two buckets have the same contents.')
 ARGS = PARSER.parse_args()
+
 
 # The mode to use when writing the tar file. 
 # Default is set to streaming write with gzip compression.
@@ -62,6 +65,8 @@ def main():
 			archive_bucket(ARGS.bucket_name, ARGS.archive_name, s3, ARCHIVE_SIZE, ARGS.profile, ARGS.compression)
 		elif ARGS.extract:
 			extract_bucket(ARGS.bucket_name, ARGS.new_bucket_name, ARGS.archive_name, s3, s3_client, ARGS.profile)
+		elif ARGS.verify:
+			verify_bucket(ARGS.bucket_name, ARGS.new_bucket_name, s3, s3_client)
 		else:
 			print('Nothing to do, quitting')
 	except SystemExit as e:
@@ -79,16 +84,19 @@ def main():
 
 def check_args():
 	''' Verify that either the create or extract flag is specified, but not both of at the same time. '''
-	if ARGS.create and ARGS.extract:
-		print('The create and extract arguments are incompatible, use either one or the other.')
-		sys.exit(0)
-	elif not ARGS.create and not ARGS.extract:
-		print('Either the -c or the -x flag must be specified')
-		sys.exit(0)
-	elif ARGS.extract:
+	if ARGS.create and not (ARGS.extract or ARGS.verify):
+		return
+	elif ARGS.extract and not (ARGS.create or ARGS.verify):
 		if ARGS.new_bucket_name == None:
 			print ('A new bucket name must be specified for an extract operation.')
-	return
+			sys.exit(-1)
+		return
+	elif ARGS.verify and not (ARGS.create or ARGS.extract):
+		if ARGS.new_bucket_name == None:
+			print ('A new bucket name must be specified the verify operation')
+			sys.exit(-1) 
+		return
+
 
 META = 'ResponseMetadata'
 STATUS = 'HTTPStatusCode'
@@ -105,13 +113,6 @@ def create_bucket(s3, s3_client, region, bucket_name):
 			if response[META][STATUS] != 200:
 				print(f'Bucket not created, bailing. HTTP Status is: {response[META][STATUS]}')
 				sys.exit(0)
-		else:
-			# Have not been able to figure out a simple way to check permissions, so
-			# see if we can read from and write to the bucket if it exists.
-			print('Bucket exists, checking policy')
-			policy = s3.BucketPolicy(bucket_name)
-			print(policy)
-			sys.exit(0)
 		return s3.Bucket(bucket_name)
 	except:
 		(err_type, value) = (sys.exc_info()[:2])
@@ -153,8 +154,15 @@ def archive_bucket(bucket_name, archive_name, s3, size, profile, compress):
 		bytes_written = 0
 		bucket = s3.Bucket(bucket_name)
 		for object in bucket.objects.all():
+			print(f'Key is: {object.key}, bytes_left is {ARCHIVE_SIZE - bytes_written}')
 			content = io.BytesIO()
-			bucket.download_fileobj(object.key, content)
+			# Catch ProtocolError exceptions and retry.
+			try:
+				bucket.download_fileobj(object.key, content)
+			except urllib3.exceptions.ProtocolError as e:
+				print(f'Caught ProtocolError exception downloading S3 file {object.key}, retrying.')
+				sleep(5)
+				bucket.download_fileobj(object.key, content)			
 			# Check to see if the tar file size is over the limit.
 			# If so, close the current file and open a new one. 
 			if bytes_written > size:
@@ -170,11 +178,16 @@ def archive_bucket(bucket_name, archive_name, s3, size, profile, compress):
 			tarinfo = create_tarinfo(object)
 			content.seek(0)   # Need to set the stream to the beginning.
 			tf.addfile(tarinfo, content)
+			bytes_written = bytes_written + content.getbuffer().nbytes
+			content.close()
 	except zlib.error as e:
 		print (f"Compression failed on {key}. I don't have a clue. Punting.")
 		sys.exit(-1)
 	except tarfile.HeaderError as e:
-		print (f'Tarfile got an invalid buffer turing write. Currenty writing {tar_name}. Punting on the whole operation.')
+		print (f'Tarfile got an invalid buffer during write. Currenty writing {tar_name}. Punting on the whole operation.')
+		sys.exit(-1)
+	except urllib3.exceptions.ProtocolError as e:
+		print (f'Archive function failure on key {object.key}. Error is {e.err_type}, Value is {e.value}')
 		sys.exit(-1)
 	except:
 		(err_type, value, tb) = sys.exc_info()
@@ -233,6 +246,38 @@ def extract_bucket(bucket_name, new_bucket_name, archive_name, s3, s3_client, pr
 		print (f'Unexpected error in archive_bucket, type {err_type}, value {value}')
 		traceback.print_tb(tb, limit=20)
 
+
+def verify_bucket(bucket_name, new_bucket_name, s3, s3_client):
+	''' Given the names of two buckets, step through the files in the first bucket
+			and verify that a file with the same key exists in the second bucket and has
+			the same checksum.
+	'''
+	try:
+		bucket = s3.Bucket(bucket_name)
+		new_bucket = s3.Bucket(new_bucket_name)
+		for object in bucket.objects.all():
+			md5sum = s3_client.head_object(
+					Bucket=bucket_name,
+					Key=object.key
+				)['ETag'][1:-1]
+
+			new_md5sum = s3_client.head_object(
+					Bucket=new_bucket_name,
+					Key=object.key
+				)['ETag'][1:-1]
+			if md5sum != new_md5sum:
+				print(f'Checksums differ for {object.key}.')
+				print(f'Old is: {md5sum}')
+				print(f'New is: {new_md5sum}')
+				sys.exit(-1)
+	except botocore.exceptions.ClientError as e:
+		print(f'Exception during verify. Error is {e.err_type}, value is {e.value}')
+		sys.exit(-1)
+	except:
+		(err_type, value, tb) = sys.exc_info()
+		print (f'Unexpected error in archive_bucket, type {err_type}, value {value}')
+		traceback.print_tb(tb, limit=20)   
+	return
 
 def bucket_exists(bucket_name, s3):
 	''' Verify that the bucket exists. 

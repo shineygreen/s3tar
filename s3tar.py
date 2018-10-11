@@ -2,9 +2,9 @@
 # encoding: utf-8
 
 #
-#		Read a list of buckets from a file.
-#		Compress the individual files from a bucket and add them to a tar archive.
-#		Write the tar archive to a new, archive, bucket.
+#   Read a list of buckets from a file.
+#   Compress the individual files from a bucket and add them to a tar archive.
+#   Write the tar archive to a new, archive, bucket.
 #
 
 import argparse
@@ -17,6 +17,8 @@ import traceback
 import io
 import os
 import zlib
+import threading
+import collections
  
 # How much data to put in an archive file. Default is 1TB
 ARCHIVE_SIZE = 1000000000000
@@ -44,293 +46,323 @@ UNCOMPRESS_TAIL = '.tar'
 
 
 def main():
-	''' Get the archive bucket.
-			Open the list of buckets to archive.
-			Read through the list, working on one bucket at a time.
-			Limit the size of tar files to the archive_size.
-			Name the tar files with the bucket name and aaa-zzz appended.
-	'''
-	try:
-		check_args()
-		# If the script is running on an EC2 instance with a role providing S3 access, no need
-		# for keys.
-		if ARGS.profile == None:
-			session = boto3.session.Session(region_name=ARGS.region)
-		else:
-			session = boto3.session.Session(profile_name=ARGS.profile, region_name=ARGS.region)
-		s3 = session.resource('s3')
-		s3_client = session.client('s3')
-		if ARGS.create:
-			archive = create_bucket(s3, s3_client, ARGS.region, ARGS.bucket_name)
-			archive_bucket(ARGS.bucket_name, ARGS.archive_name, s3, ARCHIVE_SIZE, ARGS.profile, ARGS.compression)
-		elif ARGS.extract:
-			extract_bucket(ARGS.bucket_name, ARGS.new_bucket_name, ARGS.archive_name, s3, s3_client, ARGS.profile)
-		elif ARGS.verify:
-			verify_bucket(ARGS.bucket_name, ARGS.new_bucket_name, s3, s3_client)
-		else:
-			print('Nothing to do, quitting')
-	except SystemExit as e:
-		if e.code == 0:
-			os._exit(0)
-		else:
-			(err_type, value, tb) = (sys.exc_info())
-			print (f'Unexpected error in main, type {err_type}, value {value}')
-			traceback.print_tb(tb, limit=10)
-	except:
-		(err_type, value, tb) = (sys.exc_info())
-		print (f'Unexpected error in main, type {err_type}, value {value}')
-		traceback.print_tb(tb, limit=10)
+  ''' Get the archive bucket.
+      Open the list of buckets to archive.
+      Read through the list, working on one bucket at a time.
+      Limit the size of tar files to the archive_size.
+      Name the tar files with the bucket name and aaa-zzz appended.
+  '''
+  try:
+    check_args()
+    # If the script is running on an EC2 instance with a role providing S3 access, no need
+    # for keys.
+    if ARGS.profile == None:
+      session = boto3.session.Session(region_name=ARGS.region)
+    else:
+      session = boto3.session.Session(profile_name=ARGS.profile, region_name=ARGS.region)
+    s3 = session.resource('s3')
+    s3_client = session.client('s3')
+    if ARGS.create:
+      archive = create_bucket(s3, s3_client, ARGS.region, ARGS.bucket_name)
+      archive_bucket(ARGS.bucket_name, ARGS.archive_name, s3, ARCHIVE_SIZE, ARGS.profile, ARGS.compression)
+    elif ARGS.extract:
+      extract_bucket(ARGS.bucket_name, ARGS.new_bucket_name, ARGS.archive_name, s3, s3_client, ARGS.profile)
+    elif ARGS.verify:
+      verify_bucket(ARGS.bucket_name, ARGS.new_bucket_name, s3, s3_client)
+    else:
+      print('Nothing to do, quitting')
+  except SystemExit as e:
+    if e.code == 0:
+      os._exit(0)
+    else:
+      (err_type, value, tb) = (sys.exc_info())
+      print (f'Unexpected error in main, type {err_type}, value {value}')
+      traceback.print_tb(tb, limit=10)
+  except:
+    (err_type, value, tb) = (sys.exc_info())
+    print (f'Unexpected error in main, type {err_type}, value {value}')
+    traceback.print_tb(tb, limit=10)
 
 
 def check_args():
-	''' Verify that either the create or extract flag is specified, but not both of at the same time. '''
-	if ARGS.create and not (ARGS.extract or ARGS.verify):
-		return
-	elif ARGS.extract and not (ARGS.create or ARGS.verify):
-		if ARGS.new_bucket_name == None:
-			print ('A new bucket name must be specified for an extract operation.')
-			sys.exit(-1)
-		return
-	elif ARGS.verify and not (ARGS.create or ARGS.extract):
-		if ARGS.new_bucket_name == None:
-			print ('A new bucket name must be specified the verify operation')
-			sys.exit(-1) 
-		return
+  ''' Verify that either the create or extract flag is specified, but not both of at the same time. '''
+  if ARGS.create and not (ARGS.extract or ARGS.verify):
+    return
+  elif ARGS.extract and not (ARGS.create or ARGS.verify):
+    if ARGS.new_bucket_name == None:
+      print ('A new bucket name must be specified for an extract operation.')
+      sys.exit(-1)
+    return
+  elif ARGS.verify and not (ARGS.create or ARGS.extract):
+    if ARGS.new_bucket_name == None:
+      print ('A new bucket name must be specified the verify operation')
+      sys.exit(-1) 
+    return
 
 
 META = 'ResponseMetadata'
 STATUS = 'HTTPStatusCode'
 def create_bucket(s3, s3_client, region, bucket_name):
-	''' See if the archive bucket exists, if not, create it.  
-	'''
-	try:	
-		if not bucket_exists(bucket_name, s3):
-			response = s3_client.create_bucket(
-					ACL='private', 
-					Bucket=bucket_name, 
-					CreateBucketConfiguration={'LocationConstraint': region}
-					)
-			if response[META][STATUS] != 200:
-				print(f'Bucket not created, bailing. HTTP Status is: {response[META][STATUS]}')
-				sys.exit(0)
-		return s3.Bucket(bucket_name)
-	except:
-		(err_type, value) = (sys.exc_info()[:2])
-		print (f'Unexpected error in get_archive, type {err_type}, value {value}')
-		sys.exit(-1)
+  ''' See if the archive bucket exists, if not, create it.  
+  '''
+  try:  
+    if not bucket_exists(bucket_name, s3):
+      response = s3_client.create_bucket(
+          ACL='private', 
+          Bucket=bucket_name, 
+          CreateBucketConfiguration={'LocationConstraint': region}
+          )
+      if response[META][STATUS] != 200:
+        print(f'Bucket not created, bailing. HTTP Status is: {response[META][STATUS]}')
+        sys.exit(0)
+    return s3.Bucket(bucket_name)
+  except:
+    (err_type, value) = (sys.exc_info()[:2])
+    print (f'Unexpected error in get_archive, type {err_type}, value {value}')
+    sys.exit(-1)
 
 
 def archive_bucket(bucket_name, archive_name, s3, size, profile, compress):
-	''' Given the name of a bucket, an S3 bucket object pointing to an archive and
-			an S3 session, open a bucket object for the bucket,
-			then read the files one at a time, compress them and
-			add them to a tar archive that is written to the archive bucket.
+  ''' Given the name of a bucket, an S3 bucket object pointing to an archive and
+      an S3 session, open a bucket object for the bucket,
+      then read the files one at a time, compress them and
+      add them to a tar archive that is written to the archive bucket.
 
-			The tar file size is constrained by S3 limits to 5TB. The actual size is
-			set to be around ARCHIVE_SIZE. If the bucket being archived contains more than ARCHIVE_SIZE
-			of compressed data, then multiple tar files are created. The tar files have a count added to their
-			name to differentiate them. The compressed files are NOT split across the tar file. That
-			is why there is an inexact size to the tar file.
-	'''
-	if compress:
-		mode = COMPRESS_MODE
-		tail = COMPRESS_TAIL
-	else:
-		mode = UNCOMPRESS_MODE
-		tail = UNCOMPRESS_TAIL
+      The tar file size is constrained by S3 limits to 5TB. The actual size is
+      set to be around ARCHIVE_SIZE. If the bucket being archived contains more than ARCHIVE_SIZE
+      of compressed data, then multiple tar files are created. The tar files have a count added to their
+      name to differentiate them. The compressed files are NOT split across the tar file. That
+      is why there is an inexact size to the tar file.
+  '''
+  if compress:
+    mode = COMPRESS_MODE
+    tail = COMPRESS_TAIL
+  else:
+    mode = UNCOMPRESS_MODE
+    tail = UNCOMPRESS_TAIL
 
-	tarfile_count = 1   # A counter to use for naming multiple tar files on the same bucket.
-	bytes_writen = 0    # Keep track of the archived tar file size so it can be limited to ARCHIVE_SIZE.
-	# Get a file handle for the tar file in the archive bucket.
-	tar_name = 's3://%s/%s_file%d%s' % (archive_name, bucket_name, tarfile_count, tail)
-	# Make sure the bucket to be archived exists, before trying to archive it.
-	if not bucket_exists(bucket_name, s3):
-		print (f'The bucket {bucket_name} does not exist, skipping.')
-		return
+  fifo = collections.deque()
+  tarfile_count = 1   # A counter to use for naming multiple tar files on the same bucket.
+  bytes_writen = 0    # Keep track of the archived tar file size so it can be limited to ARCHIVE_SIZE.
+  # Get a file handle for the tar file in the archive bucket.
+  tar_name = 's3://%s/%s_file%d%s' % (archive_name, bucket_name, tarfile_count, tail)
+  # Make sure the bucket to be archived exists, before trying to archive it.
+  if not bucket_exists(bucket_name, s3):
+    print (f'The bucket {bucket_name} does not exist, skipping.')
+    return
 
-	try: 
-		archive_out = smart_open.smart_open(tar_name, 'wb', profile_name=profile)
-		tf = tarfile.open(mode=mode, fileobj=archive_out)
-		bytes_written = 0
-		bucket = s3.Bucket(bucket_name)
-		for object in bucket.objects.all():
-			print(f'Key is: {object.key}, bytes_left is {ARCHIVE_SIZE - bytes_written}')
-			content = io.BytesIO()
-			# Catch ProtocolError exceptions and retry.
-			try:
-				bucket.download_fileobj(object.key, content)
-			except urllib3.exceptions.ProtocolError as e:
-				print(f'Caught ProtocolError exception downloading S3 file {object.key}, retrying.')
-				sleep(5)
-				bucket.download_fileobj(object.key, content)			
-			# Check to see if the tar file size is over the limit.
-			# If so, close the current file and open a new one. 
-			if bytes_written > size:
-				bytes_written = 0
-				tf.close()
-				archive_out.close()
-				tarfile_count = tarfile_count + 1
-				tar_name = 's3://%s/%s_file%d%s' % (archive_name, bucket_name, tarfile_count, tail)
-				archive_out = smart_open.smart_open(tar_name, 'wb', profile_name=profile)
-				tf = tarfile.open(mode=mode, fileobj=archive_out)
-			# Compress the content and then write it to the tar file.
-			#compressed_content = zlib.compress(content, 9)
-			tarinfo = create_tarinfo(object)
-			content.seek(0)   # Need to set the stream to the beginning.
-			tf.addfile(tarinfo, content)
-			bytes_written = bytes_written + content.getbuffer().nbytes
-			content.close()
-	except zlib.error as e:
-		print (f"Compression failed on {key}. I don't have a clue. Punting.")
-		sys.exit(-1)
-	except tarfile.HeaderError as e:
-		print (f'Tarfile got an invalid buffer during write. Currenty writing {tar_name}. Punting on the whole operation.')
-		sys.exit(-1)
-	except urllib3.exceptions.ProtocolError as e:
-		print (f'Archive function failure on key {object.key}. Error is {e.err_type}, Value is {e.value}')
-		sys.exit(-1)
-	except:
-		(err_type, value, tb) = sys.exc_info()
-		print (f'Unexpected error in archive_bucket, type {err_type}, value {value}')
-		traceback.print_tb(tb, limit=20)
+  try: 
+    archive_out = smart_open.smart_open(tar_name, 'wb', profile_name=profile)
+    tf = tarfile.open(mode=mode, fileobj=archive_out)
+    bytes_written = 0
+    bucket = s3.Bucket(bucket_name)
+    for object in bucket.objects.all():
+      print(f'Key is: {object.key}, bytes_left is {ARCHIVE_SIZE - bytes_written}')
+      content = io.BytesIO()
+      # Catch ProtocolError exceptions and retry.
+      try:
+        bucket.download_fileobj(object.key, content)
+      except urllib3.exceptions.ProtocolError as e:
+        print(f'Caught ProtocolError exception downloading S3 file {object.key}, retrying.')
+        sleep(5)
+        bucket.download_fileobj(object.key, content)      
+      # Check to see if the tar file size is over the limit.
+      # If so, close the current file and open a new one. 
+      if bytes_written > size:
+        bytes_written = 0
+        tf.close()
+        archive_out.close()
+        tarfile_count = tarfile_count + 1
+        tar_name = 's3://%s/%s_file%d%s' % (archive_name, bucket_name, tarfile_count, tail)
+        archive_out = smart_open.smart_open(tar_name, 'wb', profile_name=profile)
+        tf = tarfile.open(mode=mode, fileobj=archive_out)
+      # Compress the content and then write it to the tar file.
+      #compressed_content = zlib.compress(content, 9)
+      tarinfo = create_tarinfo(object)
+      content.seek(0)   # Need to set the stream to the beginning.
+      tf.addfile(tarinfo, content)
+      bytes_written = bytes_written + content.getbuffer().nbytes
+      content.close()
+  except zlib.error as e:
+    print (f"Compression failed on {key}. I don't have a clue. Punting.")
+    sys.exit(-1)
+  except tarfile.HeaderError as e:
+    print (f'Tarfile got an invalid buffer during write. Currenty writing {tar_name}. Punting on the whole operation.')
+    sys.exit(-1)
+  except urllib3.exceptions.ProtocolError as e:
+    print (f'Archive function failure on key {object.key}. Error is {e.err_type}, Value is {e.value}')
+    sys.exit(-1)
+  except:
+    (err_type, value, tb) = sys.exc_info()
+    print (f'Unexpected error in archive_bucket, type {err_type}, value {value}')
+    traceback.print_tb(tb, limit=20)
 
+def copy_s3_object(bucket, object, fifo, lock):
+  ''' Given bucket, an S3 member object from that bucket,
+      a fifo queue and a thread lock, grab the contents of the object
+      and store it into a BytesIO array. Create a tarinfo object from
+      the S3 member object. Then store them as a tuple in the fifo, making
+      sure to use the lock to prevent race conditions from overwriting data.
+  '''
+  content = io.BytesIO()
+  # Catch ProtocolError exceptions and retry.
+  try:
+    bucket.download_fileobj(bucket, object.key)
+  except urllib3.exceptions.ProtocolError as e:
+    print(f'Caught ProtocolError exception downloading S3 file {object.key}, retrying.')
+    sleep(15)
+    try: 
+      bucket.download_fileobj(object.key, content)
+    except urllib3.exceptions.ProtocolError as e:
+      print(f'Failed to read content for key {object.key}')
+      return False
+  try:
+    content.seek(0)
+    tarinfo = create_tarinfo(object)
+    if lock.acquire():
+      fifo.append( (tarinfo, content) )
+      lock.release()
+      return True
+    else
+      printf(f'Failed to lock fifo for {object.key}')
+      return False
 
 def extract_bucket(bucket_name, new_bucket_name, archive_name, s3, s3_client, profile):
-	''' Given the name of bucket to create and an archive bucket,
-			read all of the tar files in the archive bucket and extract
-			them to the bucket. 
-	'''
-	try:
-		# The archive bucket must exist, the new bucket must not exist.
-		# Whew! Existential issues.
-		if not bucket_exists(archive_name, s3):
-			print(f'The archive bucket, {archive_bucket} does not exist, bailing out.')
-			sys.exit(0)
-		if bucket_exists(new_bucket_name, s3):
-			print(f'The new bucket, {new_bucket_name}, already exists. Please provide name of non-existant bucket.')
-			sys.exit(0)
-		else:
-			new_bucket = create_bucket(s3, s3_client, ARGS.region, new_bucket_name)
-		archive_bucket = s3.Bucket(archive_name)
-		not_found = True  # Need to make sure we find something
-		for object in archive_bucket.objects.filter(Prefix=bucket_name):
-			not_found = False
-			tar_name = 's3://%s/%s' % (archive_name, object.key)
-			archive_in = smart_open.smart_open(tar_name, 'rb', profile_name=profile)
-			# Need to test for zip file and set mode.
-			mode = get_compressed_mode(object.key)
-			tf = tarfile.open(mode=mode, fileobj=archive_in)
-			member = tf.next()
-			while member != None:
-				with tf.extractfile(member) as data:
-					bdata = io.BytesIO()
-					for line in data:
-						bdata.write(line)
-					bdata.seek(0)
-					new_bucket.upload_fileobj(bdata, member.name)
-					bdata.close
-				member = tf.next()
-			tf.close()
-			archive_in.close()
-		if not_found:
-			print(f'Did not find any tar files with the name {bucket_name} in archive {archive_name}')
-	except SystemExit as e:
-		if e.code == 0:
-			os._exit(0)
-		else:
-			(err_type, value, tb) = (sys.exc_info())
-			print (f'Unexpected error in main, type {err_type}, value {value}')
-			traceback.print_tb(tb, limit=10)
-	except:
-		(err_type, value, tb) = sys.exc_info()
-		print (f'Unexpected error in archive_bucket, type {err_type}, value {value}')
-		traceback.print_tb(tb, limit=20)
+  ''' Given the name of bucket to create and an archive bucket,
+      read all of the tar files in the archive bucket and extract
+      them to the bucket. 
+  '''
+  try:
+    # The archive bucket must exist, the new bucket must not exist.
+    # Whew! Existential issues.
+    if not bucket_exists(archive_name, s3):
+      print(f'The archive bucket, {archive_bucket} does not exist, bailing out.')
+      sys.exit(0)
+    if bucket_exists(new_bucket_name, s3):
+      print(f'The new bucket, {new_bucket_name}, already exists. Please provide name of non-existant bucket.')
+      sys.exit(0)
+    else:
+      new_bucket = create_bucket(s3, s3_client, ARGS.region, new_bucket_name)
+    archive_bucket = s3.Bucket(archive_name)
+    not_found = True  # Need to make sure we find something
+    for object in archive_bucket.objects.filter(Prefix=bucket_name):
+      not_found = False
+      tar_name = 's3://%s/%s' % (archive_name, object.key)
+      archive_in = smart_open.smart_open(tar_name, 'rb', profile_name=profile)
+      # Need to test for zip file and set mode.
+      mode = get_compressed_mode(object.key)
+      tf = tarfile.open(mode=mode, fileobj=archive_in)
+      member = tf.next()
+      while member != None:
+        with tf.extractfile(member) as data:
+          bdata = io.BytesIO()
+          for line in data:
+            bdata.write(line)
+          bdata.seek(0)
+          new_bucket.upload_fileobj(bdata, member.name)
+          bdata.close
+        member = tf.next()
+      tf.close()
+      archive_in.close()
+    if not_found:
+      print(f'Did not find any tar files with the name {bucket_name} in archive {archive_name}')
+  except SystemExit as e:
+    if e.code == 0:
+      os._exit(0)
+    else:
+      (err_type, value, tb) = (sys.exc_info())
+      print (f'Unexpected error in main, type {err_type}, value {value}')
+      traceback.print_tb(tb, limit=10)
+  except:
+    (err_type, value, tb) = sys.exc_info()
+    print (f'Unexpected error in archive_bucket, type {err_type}, value {value}')
+    traceback.print_tb(tb, limit=20)
 
 
 def verify_bucket(bucket_name, new_bucket_name, s3, s3_client):
-	''' Given the names of two buckets, step through the files in the first bucket
-			and verify that a file with the same key exists in the second bucket and has
-			the same checksum.
-	'''
-	try:
-		bucket = s3.Bucket(bucket_name)
-		new_bucket = s3.Bucket(new_bucket_name)
-		for object in bucket.objects.all():
-			md5sum = s3_client.head_object(
-					Bucket=bucket_name,
-					Key=object.key
-				)['ETag'][1:-1]
+  ''' Given the names of two buckets, step through the files in the first bucket
+      and verify that a file with the same key exists in the second bucket and has
+      the same checksum.
+  '''
+  try:
+    bucket = s3.Bucket(bucket_name)
+    new_bucket = s3.Bucket(new_bucket_name)
+    for object in bucket.objects.all():
+      md5sum = s3_client.head_object(
+          Bucket=bucket_name,
+          Key=object.key
+        )['ETag'][1:-1]
 
-			new_md5sum = s3_client.head_object(
-					Bucket=new_bucket_name,
-					Key=object.key
-				)['ETag'][1:-1]
-			if md5sum != new_md5sum:
-				print(f'Checksums differ for {object.key}.')
-				print(f'Old is: {md5sum}')
-				print(f'New is: {new_md5sum}')
-				sys.exit(-1)
-	except botocore.exceptions.ClientError as e:
-		print(f'Exception during verify. Error is {e.err_type}, value is {e.value}')
-		sys.exit(-1)
-	except:
-		(err_type, value, tb) = sys.exc_info()
-		print (f'Unexpected error in archive_bucket, type {err_type}, value {value}')
-		traceback.print_tb(tb, limit=20)   
-	return
+      new_md5sum = s3_client.head_object(
+          Bucket=new_bucket_name,
+          Key=object.key
+        )['ETag'][1:-1]
+      if md5sum != new_md5sum:
+        print(f'Checksums differ for {object.key}.')
+        print(f'Old is: {md5sum}')
+        print(f'New is: {new_md5sum}')
+        sys.exit(-1)
+  except botocore.exceptions.ClientError as e:
+    print(f'Exception during verify. Error is {e.err_type}, value is {e.value}')
+    sys.exit(-1)
+  except:
+    (err_type, value, tb) = sys.exc_info()
+    print (f'Unexpected error in archive_bucket, type {err_type}, value {value}')
+    traceback.print_tb(tb, limit=20)   
+  return
 
 def bucket_exists(bucket_name, s3):
-	''' Verify that the bucket exists. 
-			Code stolen from,
-			https://boto3.amazonaws.com/v1/documentation/api/latest/guide/migrations3.html
-	'''
-	exists = True
-	try:
-	    s3.meta.client.head_bucket(Bucket=bucket_name)
-	except botocore.exceptions.ClientError as e:
-	    # If a client error is thrown, then check that it was a 404 error.
-	    # If it was a 404 error, then the bucket does not exist.
-	    error_code = e.response['Error']['Code']
-	    if error_code == '404':
-	        exists = False
-	return exists
+  ''' Verify that the bucket exists. 
+      Code stolen from,
+      https://boto3.amazonaws.com/v1/documentation/api/latest/guide/migrations3.html
+  '''
+  exists = True
+  try:
+      s3.meta.client.head_bucket(Bucket=bucket_name)
+  except botocore.exceptions.ClientError as e:
+      # If a client error is thrown, then check that it was a 404 error.
+      # If it was a 404 error, then the bucket does not exist.
+      error_code = e.response['Error']['Code']
+      if error_code == '404':
+          exists = False
+  return exists
 
 
 def create_tarinfo(object):
-	''' Given a file name (s3 object) and the buffer holding
-			the content, create a TarInfo object.
-	'''
-	try:
-		tarinfo = tarfile.TarInfo(object.key)
-		tarinfo.size = object.size
-		'''The mtime field represents the data modification time of the file at the time it 
-		   was archived. It represents the integer number of seconds since January 1, 1970, 
-		   00:00 Coordinated Universal Time.
-		'''
-		tarinfo.mtime = object.last_modified.timestamp()
-		tarinfo.uname = object.owner['DisplayName']
-		return tarinfo
-	except ValueError as e:
-		(err_type, value, tb) = sys.exc_info()
-		print (f'Problem in get_tarinfo, type {err_type}, value {value}')
-		traceback.print_tb(tb, limit=10)
-		sys.exit(-1)
-	except:
-		(err_type, value) = (sys.exc_info()[:2])
-		print (f'Unexpected error in get_tarinfo, type {err_type}, value {value}')
-		sys.exit(-1)
+  ''' Given a file name (s3 object) and the buffer holding
+      the content, create a TarInfo object.
+  '''
+  try:
+    tarinfo = tarfile.TarInfo(object.key)
+    tarinfo.size = object.size
+    '''The mtime field represents the data modification time of the file at the time it 
+       was archived. It represents the integer number of seconds since January 1, 1970, 
+       00:00 Coordinated Universal Time.
+    '''
+    tarinfo.mtime = object.last_modified.timestamp()
+    tarinfo.uname = object.owner['DisplayName']
+    return tarinfo
+  except ValueError as e:
+    (err_type, value, tb) = sys.exc_info()
+    print (f'Problem in get_tarinfo, type {err_type}, value {value}')
+    traceback.print_tb(tb, limit=10)
+    sys.exit(-1)
+  except:
+    (err_type, value) = (sys.exc_info()[:2])
+    print (f'Unexpected error in get_tarinfo, type {err_type}, value {value}')
+    sys.exit(-1)
 
 def get_compressed_mode(name):
-	''' Given a filename, see if it has a .gz on the end.
-			If it does, return the tar mode for reading compressed tar files.
-			If it does not, return the tar mode for reading regular tar files.
-	'''
-	filename, file_extension = os.path.splitext(name)
-	if file_extension == '.gz':
-		mode = 'r|gz'
-	else:
-		mode = 'r|'
-	return mode
+  ''' Given a filename, see if it has a .gz on the end.
+      If it does, return the tar mode for reading compressed tar files.
+      If it does not, return the tar mode for reading regular tar files.
+  '''
+  filename, file_extension = os.path.splitext(name)
+  if file_extension == '.gz':
+    mode = 'r|gz'
+  else:
+    mode = 'r|'
+  return mode
 
 if __name__ == "__main__":
-	main()
+  main()

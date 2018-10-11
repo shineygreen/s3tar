@@ -16,12 +16,12 @@ import tarfile
 import traceback
 import io
 import os
-import zlib
 import threading
 import collections
  
 # How much data to put in an archive file. Default is 1TB
-ARCHIVE_SIZE = 1000000000000
+#ARCHIVE_SIZE = 1000000000000
+ARCHIVE_SIZE = 100000000000
 
 PARSER = argparse.ArgumentParser('Tar up buckets')
 PARSER.add_argument('--bucket_name', '-b', required=True, help='The name of the bucket to archive')
@@ -121,7 +121,8 @@ def create_bucket(s3, s3_client, region, bucket_name):
     print (f'Unexpected error in get_archive, type {err_type}, value {value}')
     sys.exit(-1)
 
-
+THREAD_LIMIT = 10
+FIFO_LIMIT = 50
 def archive_bucket(bucket_name, archive_name, s3, size, profile, compress):
   ''' Given the name of a bucket, an S3 bucket object pointing to an archive and
       an S3 session, open a bucket object for the bucket,
@@ -134,40 +135,116 @@ def archive_bucket(bucket_name, archive_name, s3, size, profile, compress):
       name to differentiate them. The compressed files are NOT split across the tar file. That
       is why there is an inexact size to the tar file.
   '''
+  
+  try: 
+    # Make sure the bucket to be archived exists, before trying to archive it.
+    if not bucket_exists(bucket_name, s3):
+      print (f'The bucket {bucket_name} does not exist, skipping.')
+      return
+
+    lock = threading.Lock()
+    fifo = collections.deque()
+    # Fire up the writer  !!!!!!
+    writer = threading.Thread(target= write_tars_to_s3, 
+                              args=(bucket_name, archive_name, size, profile, compress, fifo, lock))
+    for object in bucket.objects.all():
+      print(f'Key is: {object.key}, bytes_left are {ARCHIVE_SIZE - bytes_written}') 
+      while threading.active_count() >= THREAD_LIMIT:
+        sleep(2)   
+      while len(fifo) >= FIFO_LIMIT:
+        sleep(2)
+      threading.Thread(target=copy_s3_object,
+                        args=(bucket, object, fifo, lock))
+  except tarfile.HeaderError as e:
+    print (f'Tarfile got an invalid buffer during write. Currenty writing {tar_name}. Punting on the whole operation.')
+    return
+  except urllib3.exceptions.ProtocolError as e:
+    print (f'Archive function failure on key {object.key}. Error is {e.err_type}, Value is {e.value}')
+    return
+  except:
+    (err_type, value, tb) = sys.exc_info()
+    print (f'Unexpected error in archive_bucket, type {err_type}, value {value}')
+    traceback.print_tb(tb, limit=20)
+    return
+
+
+def copy_s3_object(bucket, object, fifo, lock):
+  ''' Given bucket, an S3 member object from that bucket,
+      a fifo queue and a thread lock, grab the contents of the object
+      and store it into a BytesIO array. Create a tarinfo object from
+      the S3 member object. Then store them as a tuple in the fifo, making
+      sure to use the lock to prevent race conditions from overwriting data.
+  '''
+  content = io.BytesIO()
+  # Catch ProtocolError exceptions and retry five times
+  retry = 0  # Keep track of retries to avoid the dreaded infinite loop.
+  while True:
+    try:
+      bucket.download_fileobj(bucket, object.key)
+      break
+    except urllib3.exceptions.ProtocolError as e:
+      if retry >= 5:
+        return False
+      else:
+        retry = retry + 1
+        print(f'Caught ProtocolError exception downloading S3 file {object.key}, retry #{retry}.')
+        sleep(5*retry)
+  try:
+    content.seek(0)
+    tarinfo = create_tarinfo(object)
+    if lock.acquire():
+      fifo.append( (tarinfo, content) )
+      lock.release()
+      return True
+    else
+      printf(f'Failed to lock fifo for {object.key}')
+      return False
+  except:
+    (err_type, value, tb) = sys.exc_info()
+    print (f'Unexpected error in copy_s3_object, type {err_type}, value {value}')
+    traceback.print_tb(tb, limit=20)
+    return False
+
+
+def write_tars_to_s3(bucket_name, archive_name, size, profile, compress, fifo, lock):
+  ''' Open a smart_open file in an S3 bucket, pop a tuple off of
+      the fifo and use the tarinfo and contents of the tuple to
+      write the data in tar format to the bucket.
+  '''
   if compress:
     mode = COMPRESS_MODE
     tail = COMPRESS_TAIL
   else:
     mode = UNCOMPRESS_MODE
     tail = UNCOMPRESS_TAIL
-
-  fifo = collections.deque()
   tarfile_count = 1   # A counter to use for naming multiple tar files on the same bucket.
-  bytes_writen = 0    # Keep track of the archived tar file size so it can be limited to ARCHIVE_SIZE.
-  # Get a file handle for the tar file in the archive bucket.
   tar_name = 's3://%s/%s_file%d%s' % (archive_name, bucket_name, tarfile_count, tail)
-  # Make sure the bucket to be archived exists, before trying to archive it.
-  if not bucket_exists(bucket_name, s3):
-    print (f'The bucket {bucket_name} does not exist, skipping.')
-    return
-
+  bytes_writen = 0    # Keep track of the archived tar file size so it can be limited to ARCHIVE_SIZE.
+  highwater = 0       # Watch the size of the queue to tune the number of reader threads.
   try: 
+    # Get a file handle for the tar file in the archive bucket.
     archive_out = smart_open.smart_open(tar_name, 'wb', profile_name=profile)
     tf = tarfile.open(mode=mode, fileobj=archive_out)
-    bytes_written = 0
-    bucket = s3.Bucket(bucket_name)
-    for object in bucket.objects.all():
-      print(f'Key is: {object.key}, bytes_left is {ARCHIVE_SIZE - bytes_written}')
-      content = io.BytesIO()
-      # Catch ProtocolError exceptions and retry.
+    while True:
+      # Look for something on the queue. If nothing is there, sleep for a couple seconds and try again.
       try:
-        bucket.download_fileobj(object.key, content)
-      except urllib3.exceptions.ProtocolError as e:
-        print(f'Caught ProtocolError exception downloading S3 file {object.key}, retrying.')
-        sleep(5)
-        bucket.download_fileobj(object.key, content)      
-      # Check to see if the tar file size is over the limit.
-      # If so, close the current file and open a new one. 
+        lock.acquire()
+        (tarinfo, content) = fifo.popleft()
+        lock.release()
+        # The controlling function will put a tuple on the fifo that is (None, None)
+        # when all of the objects have been processed.
+        # If so return
+        if tarinfo == None:
+          if len(fifo) > 0
+            print(f'write_tars_to_s3 got an end mark, but there are {len(fifo)} files left to be processed.')
+          return
+      except IndexError:
+        sleep(2)
+        continue  # Skip the rest of the while loop as no tuple was found
+      queuelength = len(fifo)
+      if queuelength > highwater:  # Keep track of the high water mark.
+        highwater = queuelength
+        print(f'Highwater mark for queue is now {highwater}')
       if bytes_written > size:
         bytes_written = 0
         tf.close()
@@ -176,10 +253,6 @@ def archive_bucket(bucket_name, archive_name, s3, size, profile, compress):
         tar_name = 's3://%s/%s_file%d%s' % (archive_name, bucket_name, tarfile_count, tail)
         archive_out = smart_open.smart_open(tar_name, 'wb', profile_name=profile)
         tf = tarfile.open(mode=mode, fileobj=archive_out)
-      # Compress the content and then write it to the tar file.
-      #compressed_content = zlib.compress(content, 9)
-      tarinfo = create_tarinfo(object)
-      content.seek(0)   # Need to set the stream to the beginning.
       tf.addfile(tarinfo, content)
       bytes_written = bytes_written + content.getbuffer().nbytes
       content.close()
@@ -197,35 +270,6 @@ def archive_bucket(bucket_name, archive_name, s3, size, profile, compress):
     print (f'Unexpected error in archive_bucket, type {err_type}, value {value}')
     traceback.print_tb(tb, limit=20)
 
-def copy_s3_object(bucket, object, fifo, lock):
-  ''' Given bucket, an S3 member object from that bucket,
-      a fifo queue and a thread lock, grab the contents of the object
-      and store it into a BytesIO array. Create a tarinfo object from
-      the S3 member object. Then store them as a tuple in the fifo, making
-      sure to use the lock to prevent race conditions from overwriting data.
-  '''
-  content = io.BytesIO()
-  # Catch ProtocolError exceptions and retry.
-  try:
-    bucket.download_fileobj(bucket, object.key)
-  except urllib3.exceptions.ProtocolError as e:
-    print(f'Caught ProtocolError exception downloading S3 file {object.key}, retrying.')
-    sleep(15)
-    try: 
-      bucket.download_fileobj(object.key, content)
-    except urllib3.exceptions.ProtocolError as e:
-      print(f'Failed to read content for key {object.key}')
-      return False
-  try:
-    content.seek(0)
-    tarinfo = create_tarinfo(object)
-    if lock.acquire():
-      fifo.append( (tarinfo, content) )
-      lock.release()
-      return True
-    else
-      printf(f'Failed to lock fifo for {object.key}')
-      return False
 
 def extract_bucket(bucket_name, new_bucket_name, archive_name, s3, s3_client, profile):
   ''' Given the name of bucket to create and an archive bucket,

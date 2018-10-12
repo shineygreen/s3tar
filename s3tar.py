@@ -121,8 +121,11 @@ def create_bucket(s3, s3_client, region, bucket_name):
     print (f'Unexpected error in get_archive, type {err_type}, value {value}')
     sys.exit(-1)
 
+
 THREAD_LIMIT = 10
 FIFO_LIMIT = 50
+
+
 def archive_bucket(bucket_name, archive_name, s3, size, profile, compress):
   ''' Given the name of a bucket, an S3 bucket object pointing to an archive and
       an S3 session, open a bucket object for the bucket,
@@ -135,13 +138,11 @@ def archive_bucket(bucket_name, archive_name, s3, size, profile, compress):
       name to differentiate them. The compressed files are NOT split across the tar file. That
       is why there is an inexact size to the tar file.
   '''
-  
   try: 
     # Make sure the bucket to be archived exists, before trying to archive it.
     if not bucket_exists(bucket_name, s3):
       print (f'The bucket {bucket_name} does not exist, skipping.')
       return
-
     lock = threading.Lock()
     fifo = collections.deque()
     # Fire up the writer  !!!!!!
@@ -149,12 +150,21 @@ def archive_bucket(bucket_name, archive_name, s3, size, profile, compress):
                               args=(bucket_name, archive_name, size, profile, compress, fifo, lock))
     for object in bucket.objects.all():
       print(f'Key is: {object.key}, bytes_left are {ARCHIVE_SIZE - bytes_written}') 
-      while threading.active_count() >= THREAD_LIMIT:
+      while threading.active_count() > THREAD_LIMIT: 
         sleep(2)   
       while len(fifo) >= FIFO_LIMIT:
         sleep(2)
       threading.Thread(target=copy_s3_object,
                         args=(bucket, object, fifo, lock))
+    # All of the objects hae been passed to a thread at this point. We need to wait for the
+    # reader threads to finish up and then pass the end mark to the writer thread.
+    while threading.active_count > 1:
+      sleep 5
+    fifo.put(None, None)
+    # Now wait for the writer to finish up.
+    writer.join(timeout=120.0)
+    if writer.isAlive():
+      print(f'Writer thread has not finished. Quiting anyway.')
   except tarfile.HeaderError as e:
     print (f'Tarfile got an invalid buffer during write. Currenty writing {tar_name}. Punting on the whole operation.')
     return

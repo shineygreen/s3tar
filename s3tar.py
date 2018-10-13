@@ -25,6 +25,7 @@ import zlib
 # How much data to put in an archive file. Default is 1TB
 #ARCHIVE_SIZE = 1000000000000
 ARCHIVE_SIZE = 100000000000
+TRACK_TIME = 60.0
 
 PARSER = argparse.ArgumentParser('Tar up buckets')
 PARSER.add_argument('--bucket_name', '-b', required=True, help='The name of the bucket to archive')
@@ -155,18 +156,14 @@ def archive_bucket(bucket_name, archive_name, s3, size, profile, compress):
     writer.start()
     bucket = s3.Bucket(bucket_name)
     for object in bucket.objects.all():
-
-      while threading.active_count() > THREAD_LIMIT or len(FIFO) >= FIFO_LIMIT: 
-        print(f'Slept on limit. Thread count is {threading.active_count()}. FIFO has {len(FIFO)} objects.')
-        time.sleep(2)   
-        
+      check_limits()
       reader = threading.Thread(target=copy_s3_object,
                         args=(bucket, object))
       reader.start()
     # All of the objects hae been passed to a reader thread at this point. We need to wait for the
     # reader threads to finish up and then pass the end mark to the writer thread.
     while threading.active_count > 2:
-      time.sleep(5)
+      time.sleep(1)
     if lock.acquire():
       FIFO.append(None, None)
       lock.release()
@@ -191,6 +188,20 @@ def archive_bucket(bucket_name, archive_name, s3, size, profile, compress):
     print (f'Unexpected error in archive_bucket, type {err_type}, value {value}')
     traceback.print_tb(tb, limit=20)
     return
+
+
+def check_limits(threads, objects):
+  ''' Check to see if the thread or object count limits are exceeded.
+      Sleep for a bit if they are.
+  '''
+  current_threads = threading.active_count()
+  current_fifo = len(FIFO)
+  while current_threads > THREAD_LIMIT or current_fifo >= FIFO_LIMIT: 
+    print(f'Slept on limit. Thread count is {current_threads}. FIFO has {current_fifo} objects.')
+    time.sleep(1)    
+    current_threads = threading.active_count()
+    current_fifo = len(FIFO)
+  return  
 
 
 def copy_s3_object(bucket, object):
@@ -246,9 +257,10 @@ def write_tars_to_s3(bucket_name, archive_name, size, profile, compress):
     tail = UNCOMPRESS_TAIL
   tarfile_count = 1   # A counter to use for naming multiple tar files on the same bucket.
   tar_name = 's3://%s/%s_file%d%s' % (archive_name, bucket_name, tarfile_count, tail)
-  highwater = 0       # Watch the size of the queue to tune the number of reader threads.
   bytes_written = 0
+  all_bytes_written = 0
   time.sleep(5) # Let the readers get started.
+  timer = time.time()
   try: 
     # Get a file handle for the tar file in the archive bucket.
     archive_out = smart_open.smart_open(tar_name, 'wb', profile_name=profile)
@@ -270,12 +282,9 @@ def write_tars_to_s3(bucket_name, archive_name, size, profile, compress):
       except IndexError:
         print('Hit IndexError')
         LOCK.release()
-        time.sleep(2)
+        time.sleep(1)
         continue  # Skip the rest of the while loop as no tuple was found
       queuelength = len(FIFO)
-      if queuelength > highwater:  # Keep track of the high water mark.
-        highwater = queuelength
-        print(f'Highwater mark for queue is now {highwater}')
       if bytes_written > size:
         bytes_written = 0 
         tf.close()
@@ -286,7 +295,13 @@ def write_tars_to_s3(bucket_name, archive_name, size, profile, compress):
         archive_out = smart_open.smart_open(tar_name, 'wb', profile_name=profile)
         tf = tarfile.open(mode=mode, fileobj=archive_out)
       tf.addfile(tarinfo, content)
-      bytes_written = bytes_written + content.getbuffer().nbytes
+      content_bytes = content.getbuffer().nbytes
+      bytes_written = bytes_written + content_bytes
+      all_bytes_written = all_bytes_written + content_bytes
+      if timer = time.time() > track_time:
+        timer = time.time()
+        print(f'Write to archive rate is {all_bytes_written/track_time}')
+
       #print(f'Key is: {tarinfo.name}, bytes_left are {ARCHIVE_SIZE - bytes_written}') 
       content.close()
   except zlib.error as e:

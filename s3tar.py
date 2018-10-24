@@ -24,8 +24,7 @@ import zlib
  
 # How much data to put in an archive file. Default is 1TB
 #ARCHIVE_SIZE = 1000000000000
-ARCHIVE_SIZE = 100000000000
-TRACK_TIME = 60.0
+ARCHIVE_SIZE =  100000000000
 
 PARSER = argparse.ArgumentParser('Tar up buckets')
 PARSER.add_argument('--bucket_name', '-b', required=True, help='The name of the bucket to archive')
@@ -34,6 +33,7 @@ PARSER.add_argument('--profile', '-p', default=None, help='The AWS profile to us
 PARSER.add_argument('--archive_name', '-a', default='dai-archive', help='The name of the bucket to store the tarfiles in.')
 PARSER.add_argument('--region', '-r', default='us-west-2')
 PARSER.add_argument('--compression', '-z', action='store_true', help='Turn on gzip compression.')
+PARSER.add_argument('--internalcompression', '-i', action='store_true', help='Compress individual files before adding to archive')
 PARSER.add_argument('--create', '-c', action='store_true', help='Create a tar archive')
 PARSER.add_argument('--extract', '-x', action='store_true', help='Extract a tar archive')
 PARSER.add_argument('--verify', '-v', action='store_true', help = 'Verify that two buckets have the same contents.')
@@ -68,7 +68,7 @@ def main():
     s3_client = session.client('s3')
     if ARGS.create:
       archive = create_bucket(s3, s3_client, ARGS.region, ARGS.bucket_name)
-      archive_bucket(ARGS.bucket_name, ARGS.archive_name, s3, ARCHIVE_SIZE, ARGS.profile, ARGS.compression)
+      archive_bucket(ARGS.bucket_name, ARGS.archive_name, s3, ARCHIVE_SIZE, ARGS.profile, ARGS.compression, ARGS.internalcompression)
     elif ARGS.extract:
       extract_bucket(ARGS.bucket_name, ARGS.new_bucket_name, ARGS.archive_name, s3, s3_client, ARGS.profile)
     elif ARGS.verify:
@@ -101,6 +101,8 @@ def check_args():
     if ARGS.new_bucket_name == None:
       print ('A new bucket name must be specified the verify operation')
       sys.exit(-1) 
+  elif ARGS.compression and ARGS.internalcompression:
+    print('The compression and internalcompression switches are incompatible. Please use one or the other')
     return
 
 
@@ -126,13 +128,12 @@ def create_bucket(s3, s3_client, region, bucket_name):
     sys.exit(-1)
 
 
-THREAD_LIMIT = 60
-FIFO_LIMIT = 200
+THREAD_LIMIT = 500
+FIFO_LIMIT = 5000
 LOCK = threading.Lock()
 FIFO = collections.deque()
 
-
-def archive_bucket(bucket_name, archive_name, s3, size, profile, compress):
+def archive_bucket(bucket_name, archive_name, s3, size, profile, compress, internalcompression):
   ''' Given the name of a bucket, an S3 bucket object pointing to an archive and
       an S3 session, open a bucket object for the bucket,
       then read the files one at a time, compress them and
@@ -153,17 +154,27 @@ def archive_bucket(bucket_name, archive_name, s3, size, profile, compress):
     # Fire up the writer  !!!!!!
     writer = threading.Thread(target= write_tars_to_s3, 
                 args=(bucket_name, archive_name, size, profile, compress))
+    writer.name = 'writer_thread'
     writer.start()
     bucket = s3.Bucket(bucket_name)
     for object in bucket.objects.all():
-      check_limits()
-      reader = threading.Thread(target=copy_s3_object,
-                        args=(bucket, object))
+      # Check to see if the thread or fifo limit are exceeded. If so, sleep for a bit.
+      current_threads = threading.active_count()
+      current_fifo = len(FIFO) 
+      while current_threads >= THREAD_LIMIT or current_fifo >= FIFO_LIMIT: 
+        print(f'Slept on limit. Thread count is {current_threads}. FIFO has {current_fifo} objects.')
+        time.sleep(1)  
+        current_threads=threading.active_count()
+        current_fifo = len(FIFO)
+        
+      reader = threading.Thread(target=copy_s3_object, args=(bucket, object, internalcompression))
+      reader.name = object.key
       reader.start()
-    # All of the objects hae been passed to a reader thread at this point. We need to wait for the
-    # reader threads to finish up and then pass the end mark to the writer thread.
+    # After the for loop, all of the objects have been passed to a reader thread at this point. 
+    # Need to wait for the reader threads to finish up and then pass the end mark to the writer 
+    # thread.
     while threading.active_count > 2:
-      time.sleep(1)
+      time.sleep(5)
     if lock.acquire():
       FIFO.append(None, None)
       lock.release()
@@ -190,21 +201,7 @@ def archive_bucket(bucket_name, archive_name, s3, size, profile, compress):
     return
 
 
-def check_limits(threads, objects):
-  ''' Check to see if the thread or object count limits are exceeded.
-      Sleep for a bit if they are.
-  '''
-  current_threads = threading.active_count()
-  current_fifo = len(FIFO)
-  while current_threads > THREAD_LIMIT or current_fifo >= FIFO_LIMIT: 
-    print(f'Slept on limit. Thread count is {current_threads}. FIFO has {current_fifo} objects.')
-    time.sleep(1)    
-    current_threads = threading.active_count()
-    current_fifo = len(FIFO)
-  return  
-
-
-def copy_s3_object(bucket, object):
+def copy_s3_object(bucket, object, internalcompression):
   ''' Given bucket, an S3 member object from that bucket,
       a fifo queue and a thread lock, grab the contents of the object
       and store it into a BytesIO array. Create a tarinfo object from
@@ -228,19 +225,41 @@ def copy_s3_object(bucket, object):
         time.sleep(5*retry)
   try:
     content.seek(0)
-    tarinfo = create_tarinfo(object)
+    try:
+      extension = ''
+      if internalcompression:
+        filename, file_extension = os.path.splitext(object.key)
+        if file_extension != '.gz':
+          # gzip wants a byte array
+          content_bytes = content.getvalue()
+          content.close()
+          zipped_content = zlib.compress(content_bytes) # May catch an exception so don't overwrite content.
+          del content_bytes
+          content = io.BytesIO(zipped_content)
+          size = len(zipped_content)
+          del zipped_content
+          content.seek(0)
+          extension = '.gz'
+        else:
+          content_bytes = content.getvalue()
+          size = len(content_bytes)
+          del content_bytes
+      else:
+        content_bytes = content.getvalue()
+        size = len(content_bytes)
+        del content_bytes
+    except zlib.error as e:
+      print(f'Compression error on object {object.key}. Error is {e.value}')
+    tarinfo = create_tarinfo(object, size, extension)
     if LOCK.acquire():
       FIFO.append( (tarinfo, content) )
       LOCK.release()
-      return True
     else:
       printf(f'Failed to lock fifo for {object.key}')
-      return False
   except:
     (err_type, value, tb) = sys.exc_info()
     print (f'Unexpected error in copy_s3_object, type {err_type}, value {value}')
     traceback.print_tb(tb, limit=20)
-    return False
 
 
 def write_tars_to_s3(bucket_name, archive_name, size, profile, compress):
@@ -257,16 +276,14 @@ def write_tars_to_s3(bucket_name, archive_name, size, profile, compress):
     tail = UNCOMPRESS_TAIL
   tarfile_count = 1   # A counter to use for naming multiple tar files on the same bucket.
   tar_name = 's3://%s/%s_file%d%s' % (archive_name, bucket_name, tarfile_count, tail)
+  highwater = 0       # Watch the size of the queue to tune the number of reader threads.
   bytes_written = 0
-  all_bytes_written = 0
   time.sleep(5) # Let the readers get started.
-  timer = time.time()
   try: 
     # Get a file handle for the tar file in the archive bucket.
     archive_out = smart_open.smart_open(tar_name, 'wb', profile_name=profile)
     tf = tarfile.open(mode=mode, fileobj=archive_out)
     while True:
-
       # Look for something on the queue. If nothing is there, sleep for a couple seconds and try again.
       try:
         LOCK.acquire()
@@ -282,9 +299,12 @@ def write_tars_to_s3(bucket_name, archive_name, size, profile, compress):
       except IndexError:
         print('Hit IndexError')
         LOCK.release()
-        time.sleep(1)
+        time.sleep(2)
         continue  # Skip the rest of the while loop as no tuple was found
       queuelength = len(FIFO)
+      if queuelength > highwater:  # Keep track of the high water mark.
+        highwater = queuelength
+        print(f'Highwater mark for queue is now {highwater}')
       if bytes_written > size:
         bytes_written = 0 
         tf.close()
@@ -295,15 +315,11 @@ def write_tars_to_s3(bucket_name, archive_name, size, profile, compress):
         archive_out = smart_open.smart_open(tar_name, 'wb', profile_name=profile)
         tf = tarfile.open(mode=mode, fileobj=archive_out)
       tf.addfile(tarinfo, content)
-      content_bytes = content.getbuffer().nbytes
-      bytes_written = bytes_written + content_bytes
-      all_bytes_written = all_bytes_written + content_bytes
-      if timer = time.time() > track_time:
-        timer = time.time()
-        print(f'Write to archive rate is {all_bytes_written/track_time}')
-
+      bytes_written = bytes_written + content.getbuffer().nbytes
       #print(f'Key is: {tarinfo.name}, bytes_left are {ARCHIVE_SIZE - bytes_written}') 
       content.close()
+      del tarinfo
+      del content
   except zlib.error as e:
     print (f"Compression failed on {key}. I don't have a clue. Punting.")
     sys.exit(-1)
@@ -313,9 +329,11 @@ def write_tars_to_s3(bucket_name, archive_name, size, profile, compress):
   except urllib3.exceptions.ProtocolError as e:
     print (f'Archive function failure on key {object.key}. Error is {e.err_type}, Value is {e.value}')
     sys.exit(-1)
+  except OSError as e:
+    print(f'Key is: {tarinfo.name}, error is: {e.value}')
   except:
     (err_type, value, tb) = sys.exc_info()
-    print (f'Unexpected error in archive_bucket, type {err_type}, value {value}')
+    print (f'Unexpected error in archive_bucket, type: {err_type}, value: {value}')
     traceback.print_tb(tb, limit=20)
 
 
@@ -420,13 +438,13 @@ def bucket_exists(bucket_name, s3):
   return exists
 
 
-def create_tarinfo(object):
+def create_tarinfo(object, size, extension):
   ''' Given a file name (s3 object) and the buffer holding
       the content, create a TarInfo object.
   '''
   try:
-    tarinfo = tarfile.TarInfo(object.key)
-    tarinfo.size = object.size
+    tarinfo = tarfile.TarInfo(object.key + extension)
+    tarinfo.size = size
     '''The mtime field represents the data modification time of the file at the time it 
        was archived. It represents the integer number of seconds since January 1, 1970, 
        00:00 Coordinated Universal Time.
@@ -444,6 +462,7 @@ def create_tarinfo(object):
     print (f'Unexpected error in get_tarinfo, type {err_type}, value {value}')
     sys.exit(-1)
 
+
 def get_compressed_mode(name):
   ''' Given a filename, see if it has a .gz on the end.
       If it does, return the tar mode for reading compressed tar files.
@@ -456,5 +475,8 @@ def get_compressed_mode(name):
     mode = 'r|'
   return mode
 
+
 if __name__ == "__main__":
   main()
+
+  

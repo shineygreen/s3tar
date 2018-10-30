@@ -21,6 +21,8 @@ import collections
 import urllib3
 import time
 import zlib
+import gzip
+import shutil
  
 # How much data to put in an archive file. Default is 1TB
 #ARCHIVE_SIZE = 1000000000000
@@ -37,6 +39,7 @@ PARSER.add_argument('--internalcompression', '-i', action='store_true', help='Co
 PARSER.add_argument('--create', '-c', action='store_true', help='Create a tar archive')
 PARSER.add_argument('--extract', '-x', action='store_true', help='Extract a tar archive')
 PARSER.add_argument('--verify', '-v', action='store_true', help = 'Verify that two buckets have the same contents.')
+PARSER.add_argument('--compress_bucket', '-d', action='store_true', help='Compress the uncompressed files in a bucket')
 ARGS = PARSER.parse_args()
 
 
@@ -73,6 +76,8 @@ def main():
       extract_bucket(ARGS.bucket_name, ARGS.new_bucket_name, ARGS.archive_name, s3, s3_client, ARGS.profile)
     elif ARGS.verify:
       verify_bucket(ARGS.bucket_name, ARGS.new_bucket_name, s3, s3_client)
+    elif ARGS.compress_bucket:
+      compress_bucket(ARGS.bucket_name, ARGS.archive_name, s3)
     else:
       print('Nothing to do, quitting')
   except SystemExit as e:
@@ -90,17 +95,19 @@ def main():
 
 def check_args():
   ''' Verify that either the create or extract flag is specified, but not both of at the same time. '''
-  if ARGS.create and not (ARGS.extract or ARGS.verify):
+  if ARGS.create and not (ARGS.extract or ARGS.verify or ARGS.compress_bucket):
     return
-  elif ARGS.extract and not (ARGS.create or ARGS.verify):
+  elif ARGS.extract and not (ARGS.create or ARGS.verify or ARGS.compress_bucket):
     if ARGS.new_bucket_name == None:
       print ('A new bucket name must be specified for an extract operation.')
       sys.exit(-1)
     return
-  elif ARGS.verify and not (ARGS.create or ARGS.extract):
+  elif ARGS.verify and not (ARGS.create or ARGS.extract or ARGS.compress_bucket):
     if ARGS.new_bucket_name == None:
       print ('A new bucket name must be specified the verify operation')
       sys.exit(-1) 
+  elif ARGS.compress_bucket and not(ARGS.create or ARGS.extract or ARGS.verify):
+    return
   elif ARGS.compression and ARGS.internalcompression:
     print('The compression and internalcompression switches are incompatible. Please use one or the other')
     return
@@ -128,8 +135,8 @@ def create_bucket(s3, s3_client, region, bucket_name):
     sys.exit(-1)
 
 
-THREAD_LIMIT = 500
-FIFO_LIMIT = 5000
+THREAD_LIMIT = 300
+FIFO_LIMIT = 4000
 LOCK = threading.Lock()
 FIFO = collections.deque()
 
@@ -162,7 +169,7 @@ def archive_bucket(bucket_name, archive_name, s3, size, profile, compress, inter
       current_threads = threading.active_count()
       current_fifo = len(FIFO) 
       while current_threads >= THREAD_LIMIT or current_fifo >= FIFO_LIMIT: 
-        print(f'Slept on limit. Thread count is {current_threads}. FIFO has {current_fifo} objects.')
+        #print(f'Slept on limit. Thread count is {current_threads}. FIFO has {current_fifo} objects.')
         time.sleep(1)  
         current_threads=threading.active_count()
         current_fifo = len(FIFO)
@@ -475,6 +482,92 @@ def get_compressed_mode(name):
     mode = 'r|'
   return mode
 
+def compress_bucket(bucket_name, archive_name, s3):
+  ''' Given a bucket, go through the objects in the bucket and gzip them,
+      if they have not already been gzipped. If the flag is set, delete the
+      old object.
+  '''
+  delete = True
+  try: 
+    # Make sure the bucket to be archived exists, before trying to archive it.
+    if not bucket_exists(bucket_name, s3):
+      print(f'The bucket {bucket_name} does not exist, skipping.')
+      return
+    else:
+      bucket = s3.Bucket(bucket_name)
+    for object in bucket.objects.all():
+      filename, file_extension = os.path.splitext(object.key)
+      if file_extension != '.gz':
+        #print(f'Zipping {object.key} with extension {file_extension}')
+        # Check to see if the thread count is exceeded. If so, sleep for a bit.
+        current_threads = threading.active_count()
+        while current_threads >= THREAD_LIMIT: 
+          #print(f'Slept on limit. Thread count is {current_threads}. FIFO has {current_fifo} objects.')
+          time.sleep(1)  
+          current_threads=threading.active_count()
+          
+        zipper = threading.Thread(target=gzip_s3_object, args=(bucket, object, delete))
+        zipper.start()
+    current_threads = threading.active_count()
+    while current_threads > 1:
+      print(f'Waiting for zipper threads to finish. {current_threads} left on queue.')
+      time.sleep(10)
+      current_threads = threading.active_count()
+    return
+  except urllib3.exceptions.ProtocolError as e:
+    print (f'Archive function failure on key {object.key}. Error is {e.err_type}, Value is {e.value}')
+    return
+  except:
+    (err_type, value, tb) = sys.exc_info()
+    print (f'Unexpected error in archive_bucket, type {err_type}, value {value}')
+    traceback.print_tb(tb, limit=20)
+    return
+
+
+def gzip_s3_object(bucket, object, delete):
+  ''' Given an object, zip it's contents, create a new object in the bucket to hold
+      the zipped contents and then, if the delete flag is set, delete the original object.
+  '''
+  content = io.BytesIO()
+  # Catch ProtocolError exceptions and retry five times
+  retry = 0  # Keep track of retries to avoid the dreaded infinite loop.
+  while True:
+    try:
+      bucket.download_fileobj(object.key, content)
+      break
+    except urllib3.exceptions.ProtocolError as e:
+      if retry >= 5:
+        return False
+      else:
+        retry = retry + 1
+        print(f'Caught ProtocolError exception downloading S3 file {object.key}, retry #{retry}.')
+        time.sleep(5*retry)
+  try:
+    content.seek(0)
+    zipped_content = io.BytesIO()
+    zipped_file = gzip.GzipFile(mode='wb', fileobj=zipped_content)
+    shutil.copyfileobj(content, zipped_file)
+    zipped_file.close()
+    zipped_content.seek(0)
+    s3_name = object.key + '.gz'
+    print(f'Storing {s3_name} to S3')
+    bucket.put_object(Body=zipped_content, Key=object.key + '.gz')
+    if delete:
+      bucket.delete_objects(
+        Delete={
+          'Objects': [
+            {
+                'Key': object.key,
+            }
+            ]
+        }
+      )
+  except zlib.error as e:
+    print(f'Compression error on object {object.key}. Error is {e.value}')
+  except:
+    (err_type, value, tb) = sys.exc_info()
+    print (f'Unexpected error in gzip_s3_object, type {err_type}, value {value}')
+    traceback.print_tb(tb, limit=20)
 
 if __name__ == "__main__":
   main()

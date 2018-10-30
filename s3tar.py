@@ -507,6 +507,7 @@ def compress_bucket(bucket_name, archive_name, s3):
           current_threads=threading.active_count()
           
         zipper = threading.Thread(target=gzip_s3_object, args=(bucket, object, delete))
+        zipper.name = object.key
         zipper.start()
     current_threads = threading.active_count()
     while current_threads > 1:
@@ -523,17 +524,26 @@ def compress_bucket(bucket_name, archive_name, s3):
     traceback.print_tb(tb, limit=20)
     return
 
-
+EXTRACT='/extract/'
 def gzip_s3_object(bucket, object, delete):
   ''' Given an object, zip it's contents, create a new object in the bucket to hold
       the zipped contents and then, if the delete flag is set, delete the original object.
   '''
-  content = io.BytesIO()
+  # Make sure the path exists
+  try:
+    path = os.path.dirname(object.key)
+    os.makedirs(EXTRACT + path)
+  except FileExistsError as e:
+    pass
+  except:
+    (err_type, value, tb) = sys.exc_info()
+    print (f'Unexpected error creating path, type {err_type}, value {value}')
+    traceback.print_tb(tb, limit=20)
   # Catch ProtocolError exceptions and retry five times
   retry = 0  # Keep track of retries to avoid the dreaded infinite loop.
   while True:
     try:
-      bucket.download_fileobj(object.key, content)
+      bucket.download_file(object.key, '/extract/'+object.key)
       break
     except urllib3.exceptions.ProtocolError as e:
       if retry >= 5:
@@ -543,15 +553,13 @@ def gzip_s3_object(bucket, object, delete):
         print(f'Caught ProtocolError exception downloading S3 file {object.key}, retry #{retry}.')
         time.sleep(5*retry)
   try:
-    content.seek(0)
-    zipped_content = io.BytesIO()
-    zipped_file = gzip.GzipFile(mode='wb', fileobj=zipped_content)
-    shutil.copyfileobj(content, zipped_file)
-    zipped_file.close()
-    zipped_content.seek(0)
+    with open(EXTRACT + object.key, 'rb') as f_in:
+      with gzip.open(EXTRACT + object.key+'.gz', 'wb') as f_out:
+        shutil.copyfileobj(f_in, f_out)
     s3_name = object.key + '.gz'
-    print(f'Storing {s3_name} to S3')
-    bucket.put_object(Body=zipped_content, Key=object.key + '.gz')
+    bucket.upload_file(EXTRACT + object.key + '.gz', Key=object.key + '.gz')
+    os.remove(EXTRACT + object.key)
+    os.remove(EXTRACT + object.key + '.gz')
     if delete:
       bucket.delete_objects(
         Delete={
@@ -564,6 +572,8 @@ def gzip_s3_object(bucket, object, delete):
       )
   except zlib.error as e:
     print(f'Compression error on object {object.key}. Error is {e.value}')
+  except FileNotFoundError as e:
+    print(f'Caught a file not found error in gzip_s3_object {e.value}')
   except:
     (err_type, value, tb) = sys.exc_info()
     print (f'Unexpected error in gzip_s3_object, type {err_type}, value {value}')
